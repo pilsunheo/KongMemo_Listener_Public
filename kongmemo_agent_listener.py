@@ -130,6 +130,10 @@ async def _run_claude_sdk(prompt: str, cwd: str, room_id: str) -> dict:
     started = time.monotonic()
     lock = _lock_for_room(room_id)
 
+    # 락을 클라이언트 생성 구간에만 걸면, 첫 메시지가 아직 응답을 받는 중일 때 같은 방으로
+    # 두 번째 메시지가 오면 같은 ClaudeSDKClient에 동시에 query()/receive_response()를
+    # 걸게 되어 응답이 서로 섞일 수 있다. 그래서 한 번에 한 메시지만 처리되도록 질문-응답
+    # 전체 구간을 락으로 감싼다 - 다른 방은 서로 다른 락이라 영향 없음.
     async with lock:
         if prompt == "/clear":
             await _disconnect_and_forget(room_id)
@@ -142,29 +146,29 @@ async def _run_claude_sdk(prompt: str, cwd: str, room_id: str) -> dict:
             await client.connect()
             _active_clients[room_id] = client
 
-    async def run_query():
-        try:
-            await client.query(prompt)
-            full_output = []
-            async for msg in client.receive_response():
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            full_output.append(block.text)
-            return {"status": "success", "stdout": "".join(full_output)}
-        except Exception as e:
-            await _disconnect_and_forget(room_id)
-            return {"status": "error", "message": f"Claude SDK 오류: {e!r}"}
+        async def run_query():
+            try:
+                await client.query(prompt)
+                full_output = []
+                async for msg in client.receive_response():
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, TextBlock):
+                                full_output.append(block.text)
+                return {"status": "success", "stdout": "".join(full_output)}
+            except Exception as e:
+                await _disconnect_and_forget(room_id)
+                return {"status": "error", "message": f"Claude SDK 오류: {e!r}"}
 
-    task = asyncio.create_task(run_query())
+        task = asyncio.create_task(run_query())
 
-    while True:
-        done, _ = await asyncio.wait({task}, timeout=PROGRESS_INTERVAL_SECONDS)
-        if done:
-            break
-        print(f"[kongmemo_agent_listener] Claude SDK still running... {int(time.monotonic() - started)}s elapsed")
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=PROGRESS_INTERVAL_SECONDS)
+            if done:
+                break
+            print(f"[kongmemo_agent_listener] Claude SDK still running... {int(time.monotonic() - started)}s elapsed")
 
-    return await task
+        return await task
 
 
 async def main() -> None:
