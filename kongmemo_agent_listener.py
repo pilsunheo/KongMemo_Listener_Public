@@ -9,7 +9,7 @@ import uuid
 
 from dotenv import load_dotenv
 from supabase import create_async_client
-from claude_agent_sdk import query, ClaudeAgentOptions, delete_session
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 from claude_agent_sdk.types import AssistantMessage, TextBlock
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -98,47 +98,79 @@ def _run_legacy_engine_blocking(engine: str, prompt: str, cwd: str) -> dict:
         return {"status": "error", "message": f"{engine} 실행 중 예외: {e!r}"}
 
 
+# room_id 단위로 ClaudeSDKClient를 계속 물고 있어야 대화 맥락이 이어진다. query()는
+# SDK 자체 docstring에 "Stateless: Each query is independent, no conversation state"라고
+# 명시되어 있어 여기서 쓰면 안 되고, ClaudeAgentOptions(session_id=...)만 넘기는 것도
+# resume이 아니라서 이전 대화를 불러오지 않는다(둘은 별개 필드).
+_active_clients: dict[str, ClaudeSDKClient] = {}
+_active_clients_dangerous: dict[str, bool] = {}
+_client_locks: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for_room(room_id: str) -> asyncio.Lock:
+    if room_id not in _client_locks:
+        _client_locks[room_id] = asyncio.Lock()
+    return _client_locks[room_id]
+
+
+async def _disconnect_and_forget(room_id: str) -> None:
+    existing = _active_clients.pop(room_id, None)
+    _active_clients_dangerous.pop(room_id, None)
+    if existing is not None:
+        try:
+            await existing.disconnect()
+        except Exception:
+            pass
+
+
 async def _run_claude_sdk(prompt: str, cwd: str, room_id: str, is_dangerous: bool) -> dict:
     started = time.monotonic()
-    
-    if prompt == "/clear":
-        try:
-            await delete_session(room_id)
-            return {"status": "success", "stdout": "세션이 초기화되었습니다."}
-        except Exception as e:
-            return {"status": "success", "stdout": f"세션 초기화 (새로 시작): {e!r}"}
+    lock = _lock_for_room(room_id)
 
-    allowed = ["Read", "Grep", "Glob"]
-    if is_dangerous:
-        allowed.extend(["Bash", "Edit", "Write", "Replace", "View", "Architect"])
-        
-    options = ClaudeAgentOptions(
-        session_id=room_id,
-        allowed_tools=allowed,
-        cwd=cwd
-    )
-    
-    full_output = []
-    
+    async with lock:
+        if prompt == "/clear":
+            await _disconnect_and_forget(room_id)
+            return {"status": "success", "stdout": "세션이 초기화되었습니다."}
+
+        allowed = ["Read", "Grep", "Glob"]
+        if is_dangerous:
+            allowed.extend(["Bash", "Edit", "Write"])
+
+        client = _active_clients.get(room_id)
+        if client is not None and _active_clients_dangerous.get(room_id) != is_dangerous:
+            # 위험 도구 토글이 바뀌면 안전을 위해 세션을 새로 연다(그 순간 대화 맥락은 끊김).
+            await _disconnect_and_forget(room_id)
+            client = None
+
+        if client is None:
+            options = ClaudeAgentOptions(allowed_tools=allowed, cwd=cwd)
+            client = ClaudeSDKClient(options)
+            await client.connect()
+            _active_clients[room_id] = client
+            _active_clients_dangerous[room_id] = is_dangerous
+
     async def run_query():
         try:
-            async for msg in query(prompt=prompt, options=options):
+            await client.query(prompt)
+            full_output = []
+            async for msg in client.receive_response():
                 if isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             full_output.append(block.text)
             return {"status": "success", "stdout": "".join(full_output)}
         except Exception as e:
+            await _disconnect_and_forget(room_id)
             return {"status": "error", "message": f"Claude SDK 오류: {e!r}"}
 
     task = asyncio.create_task(run_query())
-    
+
     while True:
         done, _ = await asyncio.wait({task}, timeout=PROGRESS_INTERVAL_SECONDS)
         if done:
             break
         print(f"[kongmemo_agent_listener] Claude SDK still running... {int(time.monotonic() - started)}s elapsed")
-        
+
     return await task
 
 
@@ -157,7 +189,7 @@ async def main() -> None:
 
     async def fetch_dangerous_tools_enabled(project_slug: str) -> bool:
         try:
-            resp = await client.from_("user_projects").select("dangerous_tools_enabled").eq("slug", project_slug.lower()).maybe_single()
+            resp = await client.from_("user_projects").select("dangerous_tools_enabled").eq("slug", project_slug.lower()).maybe_single().execute()
             if resp and resp.data:
                 return bool(resp.data.get("dangerous_tools_enabled"))
             return False
