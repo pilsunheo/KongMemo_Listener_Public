@@ -193,23 +193,46 @@ async def main() -> None:
         text = result.get("stdout") or result.get("message") or "(응답 없음)"
         if result.get("stderr"):
             text += f"\n\n--- stderr ---\n{result['stderr']}"
-            
+
         if request_id is not None:
             message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"kongmemo-agent-message-{request_id}"))
         else:
             message_id = str(uuid.uuid4())
-            
+
+        agent_id = f"{engine}_pc_listener"
         await channel.send_broadcast(
             "agent_message",
             {
                 "type": "chat",
                 "roomId": room_id,
-                "agent_id": f"{engine}_pc_listener",
+                "agent_id": agent_id,
                 "agent_name": engine,
                 "content": {"text": text},
                 "messageId": message_id,
             },
         )
+
+        # Broadcast는 그 순간 폰이 연결되어 있어야만 받을 수 있고, 놓치면 영구히
+        # 사라진다(비영속). memo_items에도 같은 메시지를 직접 저장해두면, 이미 있는
+        # postgres_changes 실시간 구독과 다음 pull sync 양쪽으로 자동으로 도착해서
+        # 응답 자체를 놓치는 문제가 없어진다. 같은 message_id를 쓰므로 브로드캐스트로
+        # 이미 로컬에 들어온 것과 합쳐질 뿐, 중복 메시지가 생기지 않는다.
+        content_json = json.dumps({
+            "agent_id": agent_id,
+            "agent_name": engine,
+            "content": {"text": text},
+            "actions": [],
+        }, ensure_ascii=False)
+        try:
+            await client.rpc("insert_agent_message", {
+                "p_key_hash": API_KEY_HASH,
+                "p_room_id": room_id,
+                "p_message_id": message_id,
+                "p_content": content_json,
+                "p_sender_id": agent_id,
+            }).execute()
+        except Exception as e:
+            print(f"[kongmemo_agent_listener] failed to persist agent message to memo_items: {e}")
 
     async def process_command(data: dict) -> None:
         request_id = data.get("requestId")
