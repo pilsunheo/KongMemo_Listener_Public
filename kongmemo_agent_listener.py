@@ -103,8 +103,12 @@ def _run_legacy_engine_blocking(engine: str, prompt: str, cwd: str) -> dict:
 # 명시되어 있어 여기서 쓰면 안 되고, ClaudeAgentOptions(session_id=...)만 넘기는 것도
 # resume이 아니라서 이전 대화를 불러오지 않는다(둘은 별개 필드).
 _active_clients: dict[str, ClaudeSDKClient] = {}
-_active_clients_dangerous: dict[str, bool] = {}
 _client_locks: dict[str, asyncio.Lock] = {}
+
+# Bash/Edit/Write까지 항상 허용한다 - 폰에서 파일을 실제로 만들고 고치는 게 이 기능의
+# 핵심 목적이라, 안전 vs 편의 토글을 두는 대신 처음부터 다 열어둔다(Antigravity 엔진도
+# 이미 --dangerously-skip-permissions로 항상 전부 허용되고 있어서 통일된 동작).
+ALWAYS_ALLOWED_TOOLS = ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 
 
 def _lock_for_room(room_id: str) -> asyncio.Lock:
@@ -115,7 +119,6 @@ def _lock_for_room(room_id: str) -> asyncio.Lock:
 
 async def _disconnect_and_forget(room_id: str) -> None:
     existing = _active_clients.pop(room_id, None)
-    _active_clients_dangerous.pop(room_id, None)
     if existing is not None:
         try:
             await existing.disconnect()
@@ -123,7 +126,7 @@ async def _disconnect_and_forget(room_id: str) -> None:
             pass
 
 
-async def _run_claude_sdk(prompt: str, cwd: str, room_id: str, is_dangerous: bool) -> dict:
+async def _run_claude_sdk(prompt: str, cwd: str, room_id: str) -> dict:
     started = time.monotonic()
     lock = _lock_for_room(room_id)
 
@@ -132,22 +135,12 @@ async def _run_claude_sdk(prompt: str, cwd: str, room_id: str, is_dangerous: boo
             await _disconnect_and_forget(room_id)
             return {"status": "success", "stdout": "세션이 초기화되었습니다."}
 
-        allowed = ["Read", "Grep", "Glob"]
-        if is_dangerous:
-            allowed.extend(["Bash", "Edit", "Write"])
-
         client = _active_clients.get(room_id)
-        if client is not None and _active_clients_dangerous.get(room_id) != is_dangerous:
-            # 위험 도구 토글이 바뀌면 안전을 위해 세션을 새로 연다(그 순간 대화 맥락은 끊김).
-            await _disconnect_and_forget(room_id)
-            client = None
-
         if client is None:
-            options = ClaudeAgentOptions(allowed_tools=allowed, cwd=cwd)
+            options = ClaudeAgentOptions(allowed_tools=ALWAYS_ALLOWED_TOOLS, cwd=cwd)
             client = ClaudeSDKClient(options)
             await client.connect()
             _active_clients[room_id] = client
-            _active_clients_dangerous[room_id] = is_dangerous
 
     async def run_query():
         try:
@@ -185,16 +178,6 @@ async def main() -> None:
             return bool(result.data)
         except Exception as e:
             print(f"[kongmemo_agent_listener] key validity check failed: {e}")
-            return False
-
-    async def fetch_dangerous_tools_enabled(project_slug: str) -> bool:
-        try:
-            resp = await client.from_("user_projects").select("dangerous_tools_enabled").eq("slug", project_slug.lower()).maybe_single().execute()
-            if resp and resp.data:
-                return bool(resp.data.get("dangerous_tools_enabled"))
-            return False
-        except Exception as e:
-            print(f"[kongmemo_agent_listener] db query failed for tools: {e}")
             return False
 
     async def send_result(request_id: str | None, result: dict) -> None:
@@ -250,11 +233,7 @@ async def main() -> None:
             await send_result(request_id, {"status": "success", "message": f"{engine} 실행 시작됨 (cwd={cwd})"})
             
             if engine == "claude":
-                is_dangerous = False
-                if project_key and project_key.startswith("PROJ_"):
-                    slug = project_key.replace("PROJ_", "")
-                    is_dangerous = await fetch_dangerous_tools_enabled(slug)
-                result = await _run_claude_sdk(prompt, cwd, room_id, is_dangerous)
+                result = await _run_claude_sdk(prompt, cwd, room_id)
             elif engine in ENGINE_BIN:
                 task = asyncio.create_task(asyncio.to_thread(_run_legacy_engine_blocking, engine, prompt, cwd))
                 started = time.monotonic()
