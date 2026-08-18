@@ -14,33 +14,23 @@ from claude_agent_sdk.types import AssistantMessage, TextBlock
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-load_dotenv()
+# .env는 이 스크립트 옆(설치 폴더)에 있지만, 실행 시 cwd는 사용자가 연결하려는
+# "그 프로젝트 폴더"다(텔레그램/cokacdir 방식 — 리스너 하나 = 폴더 하나, 그 폴더로
+# cd한 채로 이 스크립트를 실행한다). 그래서 cwd 기준으로 .env를 찾는 기본 동작 대신
+# 스크립트 파일 위치를 명시해야 한다.
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 SUPABASE_URL = os.environ["KONGMEMO_SUPABASE_URL"]
 SUPABASE_ANON_KEY = os.environ["KONGMEMO_SUPABASE_ANON_KEY"]
 API_KEY = os.environ["KONGMEMO_API_KEY"]
 API_KEY_HASH = hashlib.sha256(API_KEY.encode()).hexdigest()
 
-PROJECTS_FILE = os.path.join(os.path.dirname(__file__), "projects.json")
-
-# 예전엔 개발자 본인 경로(Vault/Kong_CRM/Kong_memo)를 기본값으로 깔아뒀는데, 이건
-# 일반 사용자에게는 아무 의미 없는(오히려 낯선) 값이라 그냥 빈 registry로 시작한다.
-# 등록은 이제 앱의 "PC 폴더 연결" 버튼(client_command의 configAction)으로 한다.
-def load_project_registry() -> dict[str, str]:
-    if not os.path.exists(PROJECTS_FILE):
-        return {}
-    try:
-        with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"[kongmemo_agent_listener] {PROJECTS_FILE} 로드 실패: {e}")
-        return {}
-
-def save_project_registry() -> None:
-    with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(PROJECT_REGISTRY, f, indent=4, ensure_ascii=False)
-
-PROJECT_REGISTRY: dict[str, str] = load_project_registry()
+# 이 리스너 인스턴스가 담당하는 프로젝트 하나(예: PROJ_VAULT)와, 실행 당시의 cwd가
+# 곧 그 프로젝트의 작업 폴더다. 여러 프로젝트를 동시에 쓰려면 다른 폴더에서 이
+# 스크립트를 한 번 더(다른 터미널 창으로) 실행하면 된다 — projects.json 같은
+# 중앙 registry 없이, "그 폴더에서 실행"이 곧 등록이다.
+PROJECT_KEY = os.environ["KONGMEMO_PROJECT_KEY"]
+PROJECT_CWD = os.getcwd()
 
 ENGINE_BIN: dict[str, list[str]] = {
     "antigravity": ["agy", "-p", "--dangerously-skip-permissions"],
@@ -233,39 +223,6 @@ async def main() -> None:
         except Exception as e:
             print(f"[kongmemo_agent_listener] failed to persist agent message to memo_items: {e}")
 
-    async def handle_config_action(action: str, project_key: str | None, path: str | None, request_id: str | None) -> None:
-        if action == "list":
-            if not PROJECT_REGISTRY:
-                await send_result(request_id, {"status": "success", "message": "등록된 프로젝트가 없습니다."})
-            else:
-                lines = "\n".join(f"{k} → {v}" for k, v in PROJECT_REGISTRY.items())
-                await send_result(request_id, {"status": "success", "message": lines})
-            return
-
-        if not project_key:
-            await send_result(request_id, {"status": "error", "message": "프로젝트 키가 없습니다."})
-            return
-
-        if action == "register":
-            if not path:
-                await send_result(request_id, {"status": "error", "message": "등록할 폴더 경로가 없습니다."})
-                return
-            if not os.path.isdir(path):
-                await send_result(request_id, {"status": "error", "message": f"PC에서 이 경로를 찾을 수 없습니다: {path}"})
-                return
-            PROJECT_REGISTRY[project_key] = path
-            save_project_registry()
-            await send_result(request_id, {"status": "success", "message": f"등록 완료: {project_key} → {path}"})
-        elif action == "remove":
-            if project_key in PROJECT_REGISTRY:
-                del PROJECT_REGISTRY[project_key]
-                save_project_registry()
-                await send_result(request_id, {"status": "success", "message": f"삭제 완료: {project_key}"})
-            else:
-                await send_result(request_id, {"status": "error", "message": f"등록되어 있지 않습니다: {project_key}"})
-        else:
-            await send_result(request_id, {"status": "error", "message": f"알 수 없는 설정 명령: {action}"})
-
     async def process_command(data: dict) -> None:
         request_id = data.get("requestId")
         room_id = data.get("roomId")
@@ -273,26 +230,22 @@ async def main() -> None:
         engine = data.get("engine")
         command = data.get("command")
         args = data.get("args") or []
-        config_action = data.get("configAction")
-        print(f"[kongmemo_agent_listener] received client_command: engine={engine} projectKey={project_key} configAction={config_action} roomId={room_id}")
+        print(f"[kongmemo_agent_listener] received client_command: engine={engine} projectKey={project_key} roomId={room_id}")
+
+        if engine:
+            # 같은 API 키로 실행 중인 다른 프로젝트(다른 폴더)의 리스너 인스턴스도
+            # 같은 채널의 broadcast를 전부 받는다. 내 프로젝트가 아니면 조용히
+            # 무시한다 - 그 프로젝트를 맡은 다른 인스턴스가 응답할 것이다. 여기서
+            # 에러를 보내면 여러 인스턴스가 같은 requestId에 중복 응답하게 된다.
+            if project_key != PROJECT_KEY:
+                return
 
         if not await key_is_valid():
             await send_result(request_id, {"status": "error", "message": "API 키가 폐기되었거나 유효하지 않습니다."})
             return
 
-        if config_action:
-            await handle_config_action(config_action, project_key, data.get("path"), request_id)
-            return
-
         if engine:
-            cwd = PROJECT_REGISTRY.get(project_key)
-            if cwd is None:
-                await send_result(request_id, {
-                    "status": "error",
-                    "message": f"등록 안 된 프로젝트: {project_key}\n앱의 프로젝트 목록에서 'PC 폴더 연결' 버튼으로 이 프로젝트의 로컬 폴더를 등록해주세요."
-                })
-                return
-                
+            cwd = PROJECT_CWD
             prompt = args[0] if args else ""
             await send_result(request_id, {"status": "success", "message": f"{engine} 실행 시작됨 (cwd={cwd})"})
             
@@ -329,6 +282,7 @@ async def main() -> None:
     channel.on_broadcast(event="client_command", callback=on_client_command)
     await channel.subscribe()
     print(f"[kongmemo_agent_listener] listening on channel: {channel_name}")
+    print(f"[kongmemo_agent_listener] 프로젝트: {PROJECT_KEY} · 작업 폴더: {PROJECT_CWD}")
 
     try:
         while True:
