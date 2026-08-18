@@ -23,23 +23,22 @@ API_KEY_HASH = hashlib.sha256(API_KEY.encode()).hexdigest()
 
 PROJECTS_FILE = os.path.join(os.path.dirname(__file__), "projects.json")
 
+# 예전엔 개발자 본인 경로(Vault/Kong_CRM/Kong_memo)를 기본값으로 깔아뒀는데, 이건
+# 일반 사용자에게는 아무 의미 없는(오히려 낯선) 값이라 그냥 빈 registry로 시작한다.
+# 등록은 이제 앱의 "PC 폴더 연결" 버튼(client_command의 configAction)으로 한다.
 def load_project_registry() -> dict[str, str]:
     if not os.path.exists(PROJECTS_FILE):
-        default_registry = {
-            "PROJ_VAULT": r"c:\Users\pilsu\Vault",
-            "PROJ_KONG_CRM": r"c:\Antigravity\Kong_CRM",
-            "PROJ_KONGMEMO": r"c:\Antigravity\Kong_memo",
-        }
-        with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(default_registry, f, indent=4, ensure_ascii=False)
-        print(f"[kongmemo_agent_listener] {PROJECTS_FILE} 생성됨. 필요시 로컬 경로를 수정한 후 다시 시작해주세요.")
-        return default_registry
+        return {}
     try:
         with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
         print(f"[kongmemo_agent_listener] {PROJECTS_FILE} 로드 실패: {e}")
         return {}
+
+def save_project_registry() -> None:
+    with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(PROJECT_REGISTRY, f, indent=4, ensure_ascii=False)
 
 PROJECT_REGISTRY: dict[str, str] = load_project_registry()
 
@@ -234,6 +233,39 @@ async def main() -> None:
         except Exception as e:
             print(f"[kongmemo_agent_listener] failed to persist agent message to memo_items: {e}")
 
+    async def handle_config_action(action: str, project_key: str | None, path: str | None, request_id: str | None) -> None:
+        if action == "list":
+            if not PROJECT_REGISTRY:
+                await send_result(request_id, {"status": "success", "message": "등록된 프로젝트가 없습니다."})
+            else:
+                lines = "\n".join(f"{k} → {v}" for k, v in PROJECT_REGISTRY.items())
+                await send_result(request_id, {"status": "success", "message": lines})
+            return
+
+        if not project_key:
+            await send_result(request_id, {"status": "error", "message": "프로젝트 키가 없습니다."})
+            return
+
+        if action == "register":
+            if not path:
+                await send_result(request_id, {"status": "error", "message": "등록할 폴더 경로가 없습니다."})
+                return
+            if not os.path.isdir(path):
+                await send_result(request_id, {"status": "error", "message": f"PC에서 이 경로를 찾을 수 없습니다: {path}"})
+                return
+            PROJECT_REGISTRY[project_key] = path
+            save_project_registry()
+            await send_result(request_id, {"status": "success", "message": f"등록 완료: {project_key} → {path}"})
+        elif action == "remove":
+            if project_key in PROJECT_REGISTRY:
+                del PROJECT_REGISTRY[project_key]
+                save_project_registry()
+                await send_result(request_id, {"status": "success", "message": f"삭제 완료: {project_key}"})
+            else:
+                await send_result(request_id, {"status": "error", "message": f"등록되어 있지 않습니다: {project_key}"})
+        else:
+            await send_result(request_id, {"status": "error", "message": f"알 수 없는 설정 명령: {action}"})
+
     async def process_command(data: dict) -> None:
         request_id = data.get("requestId")
         room_id = data.get("roomId")
@@ -241,10 +273,15 @@ async def main() -> None:
         engine = data.get("engine")
         command = data.get("command")
         args = data.get("args") or []
-        print(f"[kongmemo_agent_listener] received client_command: engine={engine} projectKey={project_key} roomId={room_id}")
+        config_action = data.get("configAction")
+        print(f"[kongmemo_agent_listener] received client_command: engine={engine} projectKey={project_key} configAction={config_action} roomId={room_id}")
 
         if not await key_is_valid():
             await send_result(request_id, {"status": "error", "message": "API 키가 폐기되었거나 유효하지 않습니다."})
+            return
+
+        if config_action:
+            await handle_config_action(config_action, project_key, data.get("path"), request_id)
             return
 
         if engine:
@@ -252,7 +289,7 @@ async def main() -> None:
             if cwd is None:
                 await send_result(request_id, {
                     "status": "error",
-                    "message": f"등록 안 된 프로젝트: {project_key}\nPC의 projects.json 파일에 \"{project_key}\": \"폴더경로\" 줄을 추가한 뒤 리스너를 재시작해주세요."
+                    "message": f"등록 안 된 프로젝트: {project_key}\n앱의 프로젝트 목록에서 'PC 폴더 연결' 버튼으로 이 프로젝트의 로컬 폴더를 등록해주세요."
                 })
                 return
                 
