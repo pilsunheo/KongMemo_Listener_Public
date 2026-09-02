@@ -73,6 +73,26 @@ PC의 클로드 코드가 실제로 실행하고, 결과가 폰으로 돌아옵�
 
 ---
 
+## 3. API — 내 메모를 코드로 다루기
+
+MCP도 클로드 코드도 없이, **HTTP로 직접** 콩메모 데이터를 읽고 쓸 수 있습니다.
+파이썬, 자바스크립트, n8n 같은 자동화 도구, `curl` 한 줄로도 됩니다.
+
+```bash
+# 저장해둔 링크 전부 뽑기
+curl -s -X POST "https://iiaqvhqnafqrrxizlofl.supabase.co/rest/v1/rpc/mcp_search_items" \
+  -H "apikey: sb_publishable_hh_54DP6aBLlXMVhA__Ulg_EEPrBWKu" \
+  -H "Content-Type: application/json" \
+  -d "{\"p_key_hash\":\"$KEY_HASH\",\"p_query\":\"http\",\"p_type\":\"link\"}"
+```
+
+앱에서 발급한 키 하나면 되고, 봇을 만들거나 서버를 띄울 필요가 없습니다.
+키당 분당 60회 제한이 있습니다.
+
+**→ [전체 API 문서 보기](API.md)**
+
+---
+
 ## 안전에 대해
 
 - 두 프로그램 모두 **앱에서 발급한 API 키**로만 동작하고, 키는 SHA-256 해시로만 서버에 저장됩니다
